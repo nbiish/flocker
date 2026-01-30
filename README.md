@@ -1,8 +1,50 @@
-# Flock You: Flock Safety Detection System
+# Flocker: Flock Safety Detection System
+
+> **Fork of [colonelpanichacks/flock-you](https://github.com/colonelpanichacks/flock-you)** — Extended with standalone display clients
 
 <img src="flock.png" alt="Flock You" width="300px">
 
 **Professional surveillance camera detection for the Oui-Spy device available at [colonelpanic.tech](https://colonelpanic.tech)**
+
+## What's New in This Fork
+
+This fork adds **standalone display clients** that operate independently without requiring a host computer:
+
+### DEFLOCK Standalone Scanner (ESP32S3-Heltec-V4)
+- **Hardware**: Heltec ESP32-S3 WiFi LoRa 32 V4 with 128x64 SSD1306 OLED
+- **Version**: 3.2.0-secure
+- **Location**: [`display-clients/esp32s3-heltec-v4/`](display-clients/esp32s3-heltec-v4/)
+
+#### Features
+| Feature | Description |
+|---------|-------------|
+| WiFi Promiscuous Scan | Probe requests + beacons with SSID/MAC matching |
+| BLE Active Scan | Device names, MAC prefixes, Raven service UUIDs |
+| OLED Display | 128x64 status/alert with radar animation |
+| Scan Profiles | HIGHWAY (HWY+), URBAN (URB~), SWEEP (SWP-) |
+| Stealth Mode | Display/LED off while scanning continues |
+| Hardware Watchdog | 30s WDT auto-reboot (JPL Rule compliance) |
+| Persistent Stats | NVS storage across reboots |
+| FLOCK-ER Meter | Confidence % based on signal strength |
+
+#### Button Controls
+| Action | Trigger | Result |
+|--------|---------|--------|
+| 1-Click | <2s release + 5s wait | Cycle scan profile |
+| Hold 2-10s | Release after hold | Toggle stealth mode |
+| Hold 10s+ | Wait for HOLD:10 | Reset all stats |
+
+#### Detection Targets
+- **Flock Safety ALPR** — WiFi+BLE (SSID patterns, MAC prefixes)
+- **FS Ext Battery** — BLE device name matching
+- **Raven Gunshot Detectors** — BLE Service UUID fingerprinting
+- **Penguin Devices** — WiFi SSID patterns
+
+### Additional Display Clients
+- [`display-clients/esp32-tft/`](display-clients/esp32-tft/) — TFT display variant
+- [`display-clients/raspberry-pi/`](display-clients/raspberry-pi/) — Raspberry Pi display service
+
+---
 
 ## Overview
 
@@ -365,4 +407,6 @@ This project is provided for educational and research purposes. Please ensure co
 
 ---
 
-**Flock You: Professional surveillance detection for the privacy-conscious**
+**Flocker: Professional surveillance detection for the privacy-conscious**
+
+*Upstream: [colonelpanichacks/flock-you](https://github.com/colonelpanichacks/flock-you)*
