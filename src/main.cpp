@@ -11,14 +11,37 @@
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
 
+#ifdef ENABLE_OLED_DISPLAY
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+#endif
+
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
 
-// Hardware Configuration
-#define BUZZER_PIN 3  // GPIO3 (D2) - PWM capable pin on Xiao ESP32 S3
+// Alert Mode Configuration - Comment/uncomment to enable features
+#define ENABLE_LED_ALERT      1   // Use onboard LED for visual alerts
+#define ENABLE_BUZZER_ALERT   0   // Set to 1 if buzzer is connected
+// #define ENABLE_WIFI_WEBHOOK   1   // Uncomment to enable webhook notifications
 
-// Audio Configuration
+// Hardware Configuration - Xiao ESP32-S3
+#define BUZZER_PIN 3              // GPIO3 (D2) - PWM capable pin (if buzzer connected)
+#define LED_BUILTIN_PIN 21        // Xiao ESP32-S3 built-in LED (active LOW on some boards)
+#define RGB_BUILTIN_PIN 48        // Xiao ESP32-S3 RGB LED (WS2812 on GPIO48)
+
+// LED Alert Configuration
+#define LED_FAST_BLINK_MS 100     // Fast blink interval (detection alert)
+#define LED_SLOW_BLINK_MS 500     // Slow blink interval (heartbeat)
+#define LED_BOOT_FLASH_MS 200     // Boot sequence flash duration
+#define ALERT_BLINK_COUNT 10      // Number of fast blinks on detection
+
+// Audio Configuration (if buzzer enabled)
 #define LOW_FREQ 200      // Boot sequence - low pitch
 #define HIGH_FREQ 800     // Boot sequence - high pitch & detection alert
 #define DETECT_FREQ 1000  // Detection alert - high pitch (faster beeps)
@@ -26,6 +49,13 @@
 #define BOOT_BEEP_DURATION 300   // Boot beep duration
 #define DETECT_BEEP_DURATION 150 // Detection beep duration (faster)
 #define HEARTBEAT_DURATION 100   // Short heartbeat pulse
+
+// WiFi Webhook Configuration (optional phone notifications)
+#ifdef ENABLE_WIFI_WEBHOOK
+#define WEBHOOK_SSID "YOUR_WIFI_SSID"      // Your home WiFi SSID
+#define WEBHOOK_PASSWORD "YOUR_PASSWORD"    // Your home WiFi password
+#define WEBHOOK_URL "http://yourserver/alert" // Webhook endpoint
+#endif
 
 // WiFi Promiscuous Mode Configuration
 #define MAX_CHANNEL 13
@@ -36,15 +66,18 @@
 #define BLE_SCAN_INTERVAL 5000 // Milliseconds between scans
 static unsigned long last_ble_scan = 0;
 
-// Detection Pattern Limits
-#define MAX_SSID_PATTERNS 10
-#define MAX_MAC_PATTERNS 50
-#define MAX_DEVICE_NAMES 20
+// Detection Pattern Limits - Deprecated, using dynamic sizes from detection_patterns.h
+// #define MAX_SSID_PATTERNS 10
+// #define MAX_MAC_PATTERNS 50
+// #define MAX_DEVICE_NAMES 20
 
 // ============================================================================
 // DETECTION PATTERNS (Extracted from Real Flock Safety Device Databases)
 // ============================================================================
 
+#include "detection_patterns.h"
+
+/*
 // WiFi SSID patterns to detect (case-insensitive)
 static const char* wifi_ssid_patterns[] = {
     "flock",        // Standard Flock Safety naming
@@ -80,6 +113,7 @@ static const char* device_name_patterns[] = {
     "Flock",           // Standard Flock Safety devices
     "Pigvision"        // Pigvision surveillance systems
 };
+*/
 
 // ============================================================================
 // RAVEN SURVEILLANCE DEVICE UUID PATTERNS
@@ -133,38 +167,241 @@ static bool triggered = false;
 static bool device_in_range = false;
 static unsigned long last_detection_time = 0;
 static unsigned long last_heartbeat = 0;
+static unsigned long last_led_toggle = 0;
+static bool led_state = false;
+static int alert_blink_remaining = 0;
 static NimBLEScan* pBLEScan;
 
+// ============================================================================
+// LED ALERT SYSTEM (No buzzer required!)
+// ============================================================================
 
+void led_init()
+{
+#if ENABLE_LED_ALERT
+    pinMode(LED_BUILTIN_PIN, OUTPUT);
+    digitalWrite(LED_BUILTIN_PIN, HIGH);  // OFF (active LOW on Xiao)
+    printf("[LED] Alert system initialized on GPIO%d\n", LED_BUILTIN_PIN);
+#endif
+}
+
+void led_on()
+{
+#if ENABLE_LED_ALERT
+    digitalWrite(LED_BUILTIN_PIN, LOW);   // Active LOW
+    led_state = true;
+#endif
+}
+
+void led_off()
+{
+#if ENABLE_LED_ALERT
+    digitalWrite(LED_BUILTIN_PIN, HIGH);  // Active LOW
+    led_state = false;
+#endif
+}
+
+void led_toggle()
+{
+#if ENABLE_LED_ALERT
+    if (led_state) {
+        led_off();
+    } else {
+        led_on();
+    }
+#endif
+}
+
+// Non-blocking LED blink handler - call from loop()
+void led_alert_update()
+{
+#if ENABLE_LED_ALERT
+    unsigned long now = millis();
+    
+    // Fast blinking during active alert
+    if (alert_blink_remaining > 0) {
+        if (now - last_led_toggle >= LED_FAST_BLINK_MS) {
+            led_toggle();
+            last_led_toggle = now;
+            if (!led_state) {  // Count on OFF transitions
+                alert_blink_remaining--;
+            }
+        }
+    }
+    // Slow heartbeat blink when device in range but not actively alerting
+    else if (device_in_range) {
+        if (now - last_led_toggle >= LED_SLOW_BLINK_MS) {
+            led_toggle();
+            last_led_toggle = now;
+        }
+    }
+    // LED off when no detection
+    else {
+        if (led_state) {
+            led_off();
+        }
+    }
+#endif
+}
+
+// Blocking LED flash for boot sequence
+void led_boot_sequence()
+{
+#if ENABLE_LED_ALERT
+    printf("[LED] Boot sequence: 3 flashes\n");
+    for (int i = 0; i < 3; i++) {
+        led_on();
+        delay(LED_BOOT_FLASH_MS);
+        led_off();
+        delay(LED_BOOT_FLASH_MS);
+    }
+    printf("[LED] Ready\n\n");
+#endif
+}
 
 // ============================================================================
-// AUDIO SYSTEM
+// OLED DISPLAY FUNCTIONS
+// ============================================================================
+
+void update_oled_status(const char* status) {
+#ifdef ENABLE_OLED_DISPLAY
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.setTextSize(1);
+    display.println("FLOCK SQUAWK");
+    display.println("--------------");
+    display.setTextSize(2);
+    display.println(status);
+    display.display();
+#endif
+}
+
+void update_oled_alert(const char* type, const char* id, int rssi) {
+#ifdef ENABLE_OLED_DISPLAY
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.setTextSize(1);
+    display.println("! DETECTED !");
+    
+    display.setTextSize(1);
+    display.print("Type: "); display.println(type);
+    
+    char id_buf[15];
+    strncpy(id_buf, id, 14);
+    id_buf[14] = '\0';
+    display.print("ID:   "); display.println(id_buf);
+    
+    display.print("RSSI: "); display.print(rssi); display.println(" dBm");
+    
+    // Draw signal bar
+    int bar_width = map(rssi, -100, -30, 0, 128);
+    if(bar_width < 0) bar_width = 0;
+    if(bar_width > 128) bar_width = 128;
+    
+    display.fillRect(0, 54, bar_width, 10, SSD1306_WHITE);
+    display.drawRect(0, 54, 128, 10, SSD1306_WHITE);
+    
+    display.display();
+#endif
+}
+
+// ============================================================================
+// AUDIO SYSTEM (Optional - only if buzzer connected)
 // ============================================================================
 
 void beep(int frequency, int duration_ms)
 {
+#if ENABLE_BUZZER_ALERT
     tone(BUZZER_PIN, frequency, duration_ms);
     delay(duration_ms + 50);
+#endif
 }
 
 void boot_beep_sequence()
 {
-    printf("Initializing audio system...\n");
-    printf("Playing boot sequence: Low -> High pitch\n");
+#if ENABLE_BUZZER_ALERT
+    printf("[BUZZER] Initializing audio system...\n");
+    printf("[BUZZER] Playing boot sequence: Low -> High pitch\n");
     beep(LOW_FREQ, BOOT_BEEP_DURATION);
     beep(HIGH_FREQ, BOOT_BEEP_DURATION);
-    printf("Audio system ready\n\n");
+    printf("[BUZZER] Audio system ready\n\n");
+#endif
 }
 
 void flock_detected_beep_sequence()
 {
-    printf("FLOCK SAFETY DEVICE DETECTED!\n");
-    printf("Playing alert sequence: 3 fast high-pitch beeps\n");
+#if ENABLE_BUZZER_ALERT
+    printf("[BUZZER] Playing alert sequence: 3 fast high-pitch beeps\n");
     for (int i = 0; i < 3; i++) {
         beep(DETECT_FREQ, DETECT_BEEP_DURATION);
         if (i < 2) delay(50); // Short gap between beeps
     }
-    printf("Detection complete - device identified!\n\n");
+#endif
+}
+
+void heartbeat_pulse()
+{
+#if ENABLE_BUZZER_ALERT
+    printf("[BUZZER] Heartbeat pulse\n");
+    beep(HEARTBEAT_FREQ, HEARTBEAT_DURATION);
+    delay(100);
+    beep(HEARTBEAT_FREQ, HEARTBEAT_DURATION);
+#endif
+}
+
+// ============================================================================
+// VISUAL SERIAL ALERT (Always enabled - ASCII art detection banner)
+// ============================================================================
+
+void print_detection_banner(const char* device_type, const char* identifier, int rssi)
+{
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║  ██████╗ ███████╗████████╗███████╗ ██████╗████████╗██╗       ║\n");
+    printf("║  ██╔══██╗██╔════╝╚══██╔══╝██╔════╝██╔════╝╚══██╔══╝██║       ║\n");
+    printf("║  ██║  ██║█████╗     ██║   █████╗  ██║        ██║   ██║       ║\n");
+    printf("║  ██║  ██║██╔══╝     ██║   ██╔══╝  ██║        ██║   ╚═╝       ║\n");
+    printf("║  ██████╔╝███████╗   ██║   ███████╗╚██████╗   ██║   ██╗       ║\n");
+    printf("║  ╚═════╝ ╚══════╝   ╚═╝   ╚══════╝ ╚═════╝   ╚═╝   ╚═╝       ║\n");
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║  ⚠️  FLOCK SAFETY DEVICE DETECTED!                           ║\n");
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║  Type: %-54s ║\n", device_type);
+    printf("║  ID:   %-54s ║\n", identifier);
+    printf("║  RSSI: %-3d dBm  Signal: %-36s ║\n", rssi, 
+           rssi > -50 ? "████████████ STRONG" : 
+           (rssi > -70 ? "████████░░░░ MEDIUM" : "████░░░░░░░░ WEAK"));
+    printf("║  Time: %-54lu ║\n", millis());
+    printf("╚══════════════════════════════════════════════════════════════╝\n");
+    printf("\n");
+}
+
+void print_heartbeat_status()
+{
+    printf("[♥] Device still in range - Signal active\n");
+}
+
+// ============================================================================
+// UNIFIED ALERT SYSTEM
+// ============================================================================
+
+void trigger_detection_alert(const char* device_type, const char* identifier, int rssi)
+{
+    // Visual serial alert (always)
+    print_detection_banner(device_type, identifier, rssi);
+    
+    // LED alert (non-blocking fast blink)
+#if ENABLE_LED_ALERT
+    alert_blink_remaining = ALERT_BLINK_COUNT;
+    last_led_toggle = millis();
+#endif
+    
+    // Buzzer alert (if enabled)
+    flock_detected_beep_sequence();
+
+#ifdef ENABLE_OLED_DISPLAY
+    update_oled_alert(device_type, identifier, rssi);
+#endif
     
     // Mark device as in range and start heartbeat tracking
     device_in_range = true;
@@ -172,12 +409,10 @@ void flock_detected_beep_sequence()
     last_heartbeat = millis();
 }
 
-void heartbeat_pulse()
+void trigger_heartbeat_alert()
 {
-    printf("Heartbeat: Device still in range\n");
-    beep(HEARTBEAT_FREQ, HEARTBEAT_DURATION);
-    delay(100);
-    beep(HEARTBEAT_FREQ, HEARTBEAT_DURATION);
+    print_heartbeat_status();
+    heartbeat_pulse();
 }
 
 // ============================================================================
@@ -529,7 +764,7 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type)
         
         if (!triggered) {
             triggered = true;
-            flock_detected_beep_sequence();
+            trigger_detection_alert("WiFi Device (SSID match)", ssid, ppkt->rx_ctrl.rssi);
         }
         // Always update detection time for heartbeat tracking
         last_detection_time = millis();
@@ -541,9 +776,14 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type)
         const char* detection_type = (frame_type == 0x20) ? "probe_request_mac" : "beacon_mac";
         output_wifi_detection_json(ssid[0] ? ssid : "hidden", hdr->addr2, ppkt->rx_ctrl.rssi, detection_type);
         
+        char mac_str[18];
+        snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 hdr->addr2[0], hdr->addr2[1], hdr->addr2[2],
+                 hdr->addr2[3], hdr->addr2[4], hdr->addr2[5]);
+        
         if (!triggered) {
             triggered = true;
-            flock_detected_beep_sequence();
+            trigger_detection_alert("WiFi Device (MAC match)", mac_str, ppkt->rx_ctrl.rssi);
         }
         // Always update detection time for heartbeat tracking
         last_detection_time = millis();
@@ -575,7 +815,7 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
             output_ble_detection_json(addrStr.c_str(), name.c_str(), rssi, "mac_prefix");
             if (!triggered) {
                 triggered = true;
-                flock_detected_beep_sequence();
+                trigger_detection_alert("BLE Device (MAC match)", addrStr.c_str(), rssi);
             }
             // Always update detection time for heartbeat tracking
             last_detection_time = millis();
@@ -587,7 +827,7 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
             output_ble_detection_json(addrStr.c_str(), name.c_str(), rssi, "device_name");
             if (!triggered) {
                 triggered = true;
-                flock_detected_beep_sequence();
+                trigger_detection_alert("BLE Device (Name match)", name.c_str(), rssi);
             }
             // Always update detection time for heartbeat tracking
             last_detection_time = millis();
@@ -638,7 +878,7 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
             
             if (!triggered) {
                 triggered = true;
-                flock_detected_beep_sequence();
+                trigger_detection_alert("RAVEN Gunshot Detector", addrStr.c_str(), rssi);
             }
             // Always update detection time for heartbeat tracking
             last_detection_time = millis();
@@ -674,12 +914,25 @@ void setup()
     Serial.begin(115200);
     delay(1000);
     
-    // Initialize buzzer
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║     FLOCK SQUAWK - Surveillance Detection System            ║\n");
+    printf("║     Alert Mode: LED %s | Buzzer %s                     ║\n",
+           ENABLE_LED_ALERT ? "ON " : "OFF", ENABLE_BUZZER_ALERT ? "ON " : "OFF");
+    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+    
+    // Initialize LED alert system
+    led_init();
+    led_boot_sequence();
+    
+    // Initialize buzzer (if enabled)
+#if ENABLE_BUZZER_ALERT
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
     boot_beep_sequence();
+#endif
     
-    printf("Starting Flock Squawk Enhanced Detection System...\n\n");
+    printf("[BOOT] Starting detection system...\n\n");
     
     // Initialize WiFi in promiscuous mode
     WiFi.mode(WIFI_STA);
@@ -690,11 +943,11 @@ void setup()
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
     
-    printf("WiFi promiscuous mode enabled on channel %d\n", current_channel);
-    printf("Monitoring probe requests and beacons...\n");
+    printf("[WiFi] Promiscuous mode enabled on channel %d\n", current_channel);
+    printf("[WiFi] Monitoring probe requests and beacons...\n");
     
     // Initialize BLE
-    printf("Initializing BLE scanner...\n");
+    printf("[BLE] Initializing scanner...\n");
     NimBLEDevice::init("");
     pBLEScan = NimBLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks());
@@ -702,9 +955,21 @@ void setup()
     pBLEScan->setInterval(100);
     pBLEScan->setWindow(99);
     
-    printf("BLE scanner initialized\n");
-    printf("System ready - hunting for Flock Safety devices...\n\n");
+    printf("[BLE] Scanner initialized\n");
+    printf("\n[READY] Hunting for Flock Safety devices...\n");
+    printf("[READY] LED will blink rapidly on detection!\n\n");
     
+#ifdef ENABLE_OLED_DISPLAY
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        printf("[OLED] Allocation failed\n");
+    } else {
+        printf("[OLED] Initialized\n");
+        display.clearDisplay();
+        display.display();
+        update_oled_status("SCANNING...");
+    }
+#endif
+
     last_channel_hop = millis();
 }
 
@@ -713,21 +978,28 @@ void loop()
     // Handle channel hopping for WiFi promiscuous mode
     hop_channel();
     
+    // Update LED alert state (non-blocking)
+    led_alert_update();
+    
     // Handle heartbeat pulse if device is in range
     if (device_in_range) {
         unsigned long now = millis();
         
         // Check if 10 seconds have passed since last heartbeat
         if (now - last_heartbeat >= 10000) {
-            heartbeat_pulse();
+            trigger_heartbeat_alert();
             last_heartbeat = now;
         }
         
         // Check if device has gone out of range (no detection for 30 seconds)
         if (now - last_detection_time >= 30000) {
-            printf("Device out of range - stopping heartbeat\n");
+            printf("\n[STATUS] Device out of range - stopping alerts\n");
             device_in_range = false;
             triggered = false; // Allow new detections
+            led_off();  // Ensure LED is off
+#ifdef ENABLE_OLED_DISPLAY
+            update_oled_status("SCANNING...");
+#endif
         }
     }
     

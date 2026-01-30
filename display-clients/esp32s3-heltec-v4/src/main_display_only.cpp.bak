@@ -1,0 +1,920 @@
+/**
+ * DEFLOCK Display Client - Heltec ESP32-S3 with Built-in OLED
+ * 
+ * Real-time surveillance detection display for the Flock-You project.
+ * Optimized for Heltec WiFi LoRa 32 V3/V4 boards with 128x64 OLED.
+ * 
+ * Project: https://github.com/colonelpanichacks/flock-you
+ * Data: deflock.me
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>  // NVS storage for persistent data
+
+// ============================================================================
+// VERSION & BRANDING
+// ============================================================================
+
+#define VERSION "2.0.0"
+#define BRANDING "DEFLOCK"
+
+// ============================================================================
+// DISPLAY CONFIGURATION (from platformio.ini or defaults)
+// ============================================================================
+
+#ifndef SCREEN_WIDTH
+    #define SCREEN_WIDTH 128
+#endif
+
+#ifndef SCREEN_HEIGHT
+    #define SCREEN_HEIGHT 64
+#endif
+
+#ifndef OLED_SDA
+    #define OLED_SDA 17  // Heltec V3/V4 default
+#endif
+
+#ifndef OLED_SCL
+    #define OLED_SCL 18  // Heltec V3/V4 default
+#endif
+
+#ifndef OLED_RST
+    #define OLED_RST 21  // Heltec V3/V4 default
+#endif
+
+// Heltec Vext power control (turns on OLED power)
+#ifndef VEXT_PIN
+    #define VEXT_PIN 36  // Heltec V3/V4 default
+#endif
+
+// PRG/USER button for reset
+#ifndef PRG_BUTTON_PIN
+    #define PRG_BUTTON_PIN 0  // GPIO0 - PRG button on Heltec V3/V4
+#endif
+#define BUTTON_LONG_PRESS_MS 2000  // Hold 2 seconds to reset
+
+// ============================================================================
+// SERIAL CONFIGURATION
+// ============================================================================
+
+#define DETECTOR_BAUD 115200
+
+// ============================================================================
+// ALERT TIMING
+// ============================================================================
+
+#define ALERT_FLASH_MS      200
+#define ALERT_DURATION_MS   5000
+#define STATUS_UPDATE_MS    100
+#define RADAR_UPDATE_MS     80
+#define DETECTION_TIMEOUT_MS 30000
+
+// ============================================================================
+// GLOBALS
+// ============================================================================
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
+
+// Detection state
+struct DetectionInfo {
+    bool active;
+    unsigned long timestamp;
+    char protocol[16];
+    char deviceType[24];
+    char identifier[24];
+    char macAddress[20];
+    int rssi;
+    int threatScore;
+    char detectionMethod[20];
+};
+
+DetectionInfo currentDetection = {0};
+
+// Statistics
+unsigned long lastStatusUpdate = 0;
+unsigned long alertStartTime = 0;
+bool alertFlashState = false;
+int totalDetections = 0;
+int flockDetections = 0;
+int ravenDetections = 0;
+int penguinDetections = 0;
+unsigned long startTime = 0;
+
+// Flock-er Assurity Meter - tracks confidence based on recent positive detections
+#define ASSURITY_WINDOW_SIZE 12
+#define ASSURITY_DECAY_MS 30000
+int assurityBuffer[ASSURITY_WINDOW_SIZE] = {0};
+int assurityIndex = 0;
+int assurityLevel = 0;              // 0-100 current assurity level
+unsigned long lastAssurityDecay = 0;
+int lastRssi = -100;                // Last RSSI for strength indicator
+
+// Unique Device Tracking - deduplicates across WiFi/BLE/GPS detections
+#define MAX_UNIQUE_DEVICES 32
+#define DEVICE_EXPIRY_MS 300000  // 5 minutes - device considered "gone" after this
+struct UniqueDevice {
+    char macAddress[20];        // Primary identifier
+    char protocol[8];           // WIFI, BLE, or MULTI
+    unsigned long firstSeen;
+    unsigned long lastSeen;
+    int detectionCount;         // How many times detected
+    int maxRssi;                // Strongest signal seen
+    bool confirmed;             // High confidence match
+};
+UniqueDevice uniqueDevices[MAX_UNIQUE_DEVICES];
+int uniqueDeviceCount = 0;
+
+// Persistent storage
+Preferences prefs;
+int persistentDeviceCount = 0;  // Total unique devices ever detected (persists across reboots)
+unsigned long lastSaveTime = 0;
+#define SAVE_INTERVAL_MS 60000  // Save to NVS every 60 seconds (to reduce wear)
+
+// Button state
+unsigned long buttonPressStart = 0;
+bool buttonWasPressed = false;
+bool showingResetConfirm = false;
+unsigned long resetConfirmTime = 0;
+
+// Radar animation
+int radarAngle = 0;
+unsigned long lastRadarUpdate = 0;
+
+// Serial buffer
+char serialBuffer[2048];
+int bufferIndex = 0;
+
+// Connection state
+bool detectorConnected = false;
+unsigned long lastDataReceived = 0;
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+const char* getShortDeviceType(const char* deviceType)
+{
+    if (strstr(deviceType, "FLOCK")) return "FLOCK";
+    if (strstr(deviceType, "RAVEN")) return "RAVEN";
+    if (strstr(deviceType, "PENGUIN")) return "PENGUIN";
+    return "SURV";
+}
+
+void formatUptime(char* buffer, size_t len, unsigned long ms)
+{
+    unsigned long secs = ms / 1000;
+    unsigned long mins = secs / 60;
+    unsigned long hrs = mins / 60;
+    snprintf(buffer, len, "%02lu:%02lu", hrs, mins % 60);
+}
+
+// Calculate assurity level from detection buffer
+void updateAssurityLevel()
+{
+    int sum = 0;
+    for (int i = 0; i < ASSURITY_WINDOW_SIZE; i++) {
+        sum += assurityBuffer[i];
+    }
+    assurityLevel = constrain((sum * 100) / (ASSURITY_WINDOW_SIZE * 10), 0, 100);
+}
+
+// Add a positive detection to the assurity meter
+void recordPositiveDetection(int score)
+{
+    assurityBuffer[assurityIndex] = constrain(score, 1, 10);
+    assurityIndex = (assurityIndex + 1) % ASSURITY_WINDOW_SIZE;
+    updateAssurityLevel();
+    lastAssurityDecay = millis();
+}
+
+// Decay assurity over time when no detections
+void decayAssurity()
+{
+    if (millis() - lastAssurityDecay > ASSURITY_DECAY_MS) {
+        int decayIdx = (assurityIndex + 1) % ASSURITY_WINDOW_SIZE;
+        if (assurityBuffer[decayIdx] > 0) {
+            assurityBuffer[decayIdx]--;
+            updateAssurityLevel();
+        }
+        lastAssurityDecay = millis();
+    }
+}
+
+// Get assurity label (short for OLED)
+const char* getAssurityLabel(int level)
+{
+    if (level >= 75) return "CONFIRMED";
+    if (level >= 50) return "LIKELY";
+    if (level >= 25) return "POSSIBLE";
+    return "LOW";
+}
+
+// ============================================================================
+// UNIQUE DEVICE TRACKING
+// ============================================================================
+
+// Normalize MAC address for comparison (remove colons, uppercase)
+void normalizeMac(const char* input, char* output, size_t len)
+{
+    int j = 0;
+    for (int i = 0; input[i] && j < (int)len - 1; i++) {
+        if (input[i] != ':' && input[i] != '-') {
+            output[j++] = toupper(input[i]);
+        }
+    }
+    output[j] = '\0';
+}
+
+// Check if two MACs match (handles different formats)
+bool macMatches(const char* mac1, const char* mac2)
+{
+    char norm1[18], norm2[18];
+    normalizeMac(mac1, norm1, sizeof(norm1));
+    normalizeMac(mac2, norm2, sizeof(norm2));
+    return strcmp(norm1, norm2) == 0;
+}
+
+// Find device in tracking array, returns index or -1
+int findUniqueDevice(const char* mac)
+{
+    for (int i = 0; i < uniqueDeviceCount; i++) {
+        if (macMatches(uniqueDevices[i].macAddress, mac)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Expire old devices and compact array
+void expireOldDevices()
+{
+    unsigned long now = millis();
+    int writeIdx = 0;
+    
+    for (int i = 0; i < uniqueDeviceCount; i++) {
+        if (now - uniqueDevices[i].lastSeen < DEVICE_EXPIRY_MS) {
+            if (writeIdx != i) {
+                memcpy(&uniqueDevices[writeIdx], &uniqueDevices[i], sizeof(UniqueDevice));
+            }
+            writeIdx++;
+        }
+    }
+    uniqueDeviceCount = writeIdx;
+}
+
+// Track a unique device detection - returns true if this is a NEW unique device
+bool trackUniqueDevice(const char* mac, const char* protocol, int rssi, bool highConfidence)
+{
+    // Only track high-confidence surveillance device detections
+    if (!highConfidence) return false;
+    
+    // Check for valid MAC
+    if (!mac || strlen(mac) < 8) return false;
+    
+    unsigned long now = millis();
+    int idx = findUniqueDevice(mac);
+    
+    if (idx >= 0) {
+        // Existing device - update it
+        uniqueDevices[idx].lastSeen = now;
+        uniqueDevices[idx].detectionCount++;
+        if (rssi > uniqueDevices[idx].maxRssi) {
+            uniqueDevices[idx].maxRssi = rssi;
+        }
+        // If detected via different protocol, mark as MULTI
+        if (strcmp(uniqueDevices[idx].protocol, protocol) != 0 &&
+            strcmp(uniqueDevices[idx].protocol, "MULTI") != 0) {
+            strlcpy(uniqueDevices[idx].protocol, "MULTI", sizeof(uniqueDevices[idx].protocol));
+        }
+        return false;  // Not a new device
+    }
+    
+    // New device - add it if we have room
+    if (uniqueDeviceCount >= MAX_UNIQUE_DEVICES) {
+        // Try to expire old devices first
+        expireOldDevices();
+        if (uniqueDeviceCount >= MAX_UNIQUE_DEVICES) {
+            // Still full, remove oldest
+            memmove(&uniqueDevices[0], &uniqueDevices[1], 
+                    sizeof(UniqueDevice) * (MAX_UNIQUE_DEVICES - 1));
+            uniqueDeviceCount--;
+        }
+    }
+    
+    // Add new device
+    idx = uniqueDeviceCount++;
+    strlcpy(uniqueDevices[idx].macAddress, mac, sizeof(uniqueDevices[idx].macAddress));
+    strlcpy(uniqueDevices[idx].protocol, protocol, sizeof(uniqueDevices[idx].protocol));
+    uniqueDevices[idx].firstSeen = now;
+    uniqueDevices[idx].lastSeen = now;
+    uniqueDevices[idx].detectionCount = 1;
+    uniqueDevices[idx].maxRssi = rssi;
+    uniqueDevices[idx].confirmed = highConfidence;
+    
+    // INCREMENT PERSISTENT COUNTER - this is the fire-and-forget metric!
+    persistentDeviceCount++;
+    
+    Serial.printf("[UNIQUE] New device #%d (total: %d): %s via %s\n", 
+                  uniqueDeviceCount, persistentDeviceCount, mac, protocol);
+    return true;  // New unique device!
+}
+
+// Get count of confirmed unique devices
+int getConfirmedDeviceCount()
+{
+    int count = 0;
+    for (int i = 0; i < uniqueDeviceCount; i++) {
+        if (uniqueDevices[i].confirmed) count++;
+    }
+    return count;
+}
+
+// ============================================================================
+// PERSISTENT STORAGE
+// ============================================================================
+
+void loadPersistentData()
+{
+    prefs.begin("deflock", true);  // Read-only mode
+    persistentDeviceCount = prefs.getInt("devCount", 0);
+    totalDetections = prefs.getInt("totalDet", 0);
+    flockDetections = prefs.getInt("flockDet", 0);
+    ravenDetections = prefs.getInt("ravenDet", 0);
+    penguinDetections = prefs.getInt("penguinDet", 0);
+    prefs.end();
+    
+    Serial.printf("[NVS] Loaded: %d unique devices, %d total detections\n", 
+                  persistentDeviceCount, totalDetections);
+}
+
+void savePersistentData()
+{
+    prefs.begin("deflock", false);  // Read-write mode
+    prefs.putInt("devCount", persistentDeviceCount);
+    prefs.putInt("totalDet", totalDetections);
+    prefs.putInt("flockDet", flockDetections);
+    prefs.putInt("ravenDet", ravenDetections);
+    prefs.putInt("penguinDet", penguinDetections);
+    prefs.end();
+    
+    lastSaveTime = millis();
+    Serial.printf("[NVS] Saved: %d unique devices\n", persistentDeviceCount);
+}
+
+void resetPersistentData()
+{
+    prefs.begin("deflock", false);
+    prefs.clear();
+    prefs.end();
+    
+    persistentDeviceCount = 0;
+    totalDetections = 0;
+    flockDetections = 0;
+    ravenDetections = 0;
+    penguinDetections = 0;
+    uniqueDeviceCount = 0;
+    assurityLevel = 0;
+    memset(assurityBuffer, 0, sizeof(assurityBuffer));
+    memset(uniqueDevices, 0, sizeof(uniqueDevices));
+    
+    Serial.println("[NVS] All data reset!");
+}
+
+// Check for periodic save
+void checkPeriodicSave()
+{
+    if (millis() - lastSaveTime > SAVE_INTERVAL_MS) {
+        savePersistentData();
+    }
+}
+
+// ============================================================================
+// BUTTON HANDLING
+// ============================================================================
+
+void checkResetButton()
+{
+    bool buttonPressed = (digitalRead(PRG_BUTTON_PIN) == LOW);
+    
+    if (buttonPressed && !buttonWasPressed) {
+        // Button just pressed
+        buttonPressStart = millis();
+        buttonWasPressed = true;
+    } else if (buttonPressed && buttonWasPressed) {
+        // Button still held - check for long press
+        if (millis() - buttonPressStart > BUTTON_LONG_PRESS_MS && !showingResetConfirm) {
+            // Long press detected - reset!
+            resetPersistentData();
+            showingResetConfirm = true;
+            resetConfirmTime = millis();
+            
+            // Visual feedback
+            display.clearDisplay();
+            display.setTextSize(2);
+            display.setTextColor(SSD1306_WHITE);
+            display.setCursor(20, 20);
+            display.print("RESET!");
+            display.setTextSize(1);
+            display.setCursor(15, 45);
+            display.print("Counter cleared");
+            display.display();
+        }
+    } else if (!buttonPressed && buttonWasPressed) {
+        // Button released
+        buttonWasPressed = false;
+    }
+    
+    // Clear reset confirmation after 2 seconds
+    if (showingResetConfirm && millis() - resetConfirmTime > 2000) {
+        showingResetConfirm = false;
+    }
+}
+
+// ============================================================================
+// DISPLAY FUNCTIONS
+// ============================================================================
+
+void drawHeader()
+{
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.print(BRANDING);
+    
+    // Persistent unique device count in top right (the key metric!)
+    if (persistentDeviceCount > 0) {
+        // Show count with box highlight
+        char countStr[8];
+        snprintf(countStr, sizeof(countStr), "%d", persistentDeviceCount);
+        int countWidth = strlen(countStr) * 6;
+        int boxX = SCREEN_WIDTH - countWidth - 6;
+        display.fillRect(boxX, 0, countWidth + 4, 8, SSD1306_WHITE);
+        display.setTextColor(SSD1306_BLACK);
+        display.setCursor(boxX + 2, 0);
+        display.print(countStr);
+        display.setTextColor(SSD1306_WHITE);
+    } else {
+        // Connection indicator when no devices found
+        display.setCursor(SCREEN_WIDTH - 12, 0);
+        if (currentDetection.active) {
+            display.print("!!");
+        } else if (detectorConnected) {
+            display.print("OK");
+        } else {
+            display.print("--");
+        }
+    }
+    
+    // Separator line
+    display.drawLine(0, 9, SCREEN_WIDTH, 9, SSD1306_WHITE);
+}
+
+void drawRadar(int centerX, int centerY, int radius)
+{
+    // Draw circles
+    display.drawCircle(centerX, centerY, radius, SSD1306_WHITE);
+    display.drawCircle(centerX, centerY, radius * 2 / 3, SSD1306_WHITE);
+    display.drawCircle(centerX, centerY, radius / 3, SSD1306_WHITE);
+    
+    // Draw sweep line
+    float rad = radarAngle * PI / 180.0;
+    int lineX = centerX + cos(rad) * radius;
+    int lineY = centerY + sin(rad) * radius;
+    display.drawLine(centerX, centerY, lineX, lineY, SSD1306_WHITE);
+}
+
+void drawIdleScreen()
+{
+    display.clearDisplay();
+    drawHeader();
+    
+    // Status
+    display.setTextSize(1);
+    display.setCursor(0, 12);
+    display.print("SCANNING");
+    
+    // Animated dots
+    int dots = (millis() / 400) % 4;
+    for (int i = 0; i < dots; i++) {
+        display.print(".");
+    }
+    
+    // ========== FLOCK-ER ASSURITY METER ==========
+    display.setCursor(0, 22);
+    display.printf("FLOCK-ER:%s", getAssurityLabel(assurityLevel));
+    
+    // Draw assurity bar (segmented)
+    int barY = 31;
+    int barWidth = 80;
+    display.drawRect(0, barY, barWidth + 2, 6, SSD1306_WHITE);
+    int fillWidth = map(assurityLevel, 0, 100, 0, barWidth);
+    if (fillWidth > 0) {
+        display.fillRect(1, barY + 1, fillWidth, 4, SSD1306_WHITE);
+    }
+    // Percentage at end of bar
+    display.setCursor(barWidth + 6, barY - 1);
+    display.printf("%d%%", assurityLevel);
+    
+    // ========== SIGNAL STRENGTH ==========
+    display.setCursor(0, 40);
+    if (lastRssi > -100) {
+        display.printf("SIG:%ddBm", lastRssi);
+        // Mini signal bar
+        int sigBarX = 70;
+        int sigBarW = 30;
+        display.drawRect(sigBarX, 40, sigBarW + 2, 6, SSD1306_WHITE);
+        int sigFill = map(constrain(lastRssi, -100, -30), -100, -30, 0, sigBarW);
+        if (sigFill > 0) {
+            display.fillRect(sigBarX + 1, 41, sigFill, 4, SSD1306_WHITE);
+        }
+    } else {
+        display.print("SIG:--");
+    }
+    
+    // Stats line (compact: F=flock, R=raven, P=penguin)
+    display.setCursor(0, 50);
+    display.printf("F:%d R:%d P:%d", flockDetections, ravenDetections, penguinDetections);
+    
+    // Status line - always show uptime + last detection time
+    display.setCursor(0, 58);
+    char uptimeStr[10];
+    formatUptime(uptimeStr, sizeof(uptimeStr), millis() - startTime);
+    
+    if (lastDataReceived > 0 && totalDetections > 0) {
+        // Show both uptime and time since last detection
+        unsigned long sinceLastMs = millis() - lastDataReceived;
+        char lastStr[10];
+        formatUptime(lastStr, sizeof(lastStr), sinceLastMs);
+        display.printf("UP:%s L:%s", uptimeStr, lastStr);
+    } else {
+        // No detections yet, just show uptime
+        display.printf("UP:%s L:--", uptimeStr);
+    }
+    
+    display.display();
+}
+
+void drawAlertScreen()
+{
+    // Flash effect
+    unsigned long elapsed = millis() - alertStartTime;
+    bool shouldFlash = (elapsed < ALERT_DURATION_MS) && ((elapsed / ALERT_FLASH_MS) % 2 == 0);
+    
+    display.clearDisplay();
+    
+    if (shouldFlash) {
+        // Inverted (white background)
+        display.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
+        display.setTextColor(SSD1306_BLACK);
+    } else {
+        display.setTextColor(SSD1306_WHITE);
+    }
+    
+    // ALERT header
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    display.print("ALERT!");
+    
+    // Device type
+    display.setTextSize(1);
+    display.setCursor(75, 4);
+    display.print(getShortDeviceType(currentDetection.deviceType));
+    
+    // Separator
+    int sepY = shouldFlash ? 17 : 17;
+    display.drawLine(0, sepY, SCREEN_WIDTH, sepY, shouldFlash ? SSD1306_BLACK : SSD1306_WHITE);
+    
+    // Detection info
+    display.setCursor(0, 20);
+    display.printf("%s", currentDetection.protocol);
+    
+    display.setCursor(0, 30);
+    // Truncate MAC for display
+    char shortMac[12];
+    strncpy(shortMac, currentDetection.macAddress, 11);
+    shortMac[11] = '\0';
+    display.printf("MAC:%s", shortMac);
+    
+    display.setCursor(0, 40);
+    display.printf("RSSI:%ddBm", currentDetection.rssi);
+    
+    // Signal bar
+    int barWidth = map(constrain(currentDetection.rssi, -100, -30), -100, -30, 2, 40);
+    int barY = 40;
+    int barX = 80;
+    display.drawRect(barX, barY, 42, 8, shouldFlash ? SSD1306_BLACK : SSD1306_WHITE);
+    display.fillRect(barX + 1, barY + 1, barWidth, 6, shouldFlash ? SSD1306_BLACK : SSD1306_WHITE);
+    
+    // Threat score
+    display.setTextSize(1);
+    display.setCursor(0, 52);
+    display.printf("THREAT:%d%%", currentDetection.threatScore);
+    
+    // Detection number
+    display.setCursor(80, 52);
+    display.printf("#%d", totalDetections);
+    
+    display.display();
+}
+
+void updateDisplay()
+{
+    if (currentDetection.active && 
+        (millis() - currentDetection.timestamp < DETECTION_TIMEOUT_MS)) {
+        drawAlertScreen();
+    } else {
+        currentDetection.active = false;
+        
+        // Update radar animation
+        if (millis() - lastRadarUpdate > RADAR_UPDATE_MS) {
+            radarAngle = (radarAngle + 12) % 360;
+            lastRadarUpdate = millis();
+        }
+        
+        drawIdleScreen();
+    }
+}
+
+// ============================================================================
+// JSON PARSING
+// ============================================================================
+
+void parseDetectionJson(const char* json)
+{
+    StaticJsonDocument<1024> doc;
+    DeserializationError error = deserializeJson(doc, json);
+    
+    if (error) {
+        Serial.printf("JSON parse error: %s\n", error.c_str());
+        return;
+    }
+    
+    // Check if this is a detection
+    if (!doc.containsKey("protocol") && !doc.containsKey("detection_type")) {
+        return;
+    }
+    
+    // Mark data received
+    lastDataReceived = millis();
+    detectorConnected = true;
+    
+    // Reset and populate new detection
+    memset(&currentDetection, 0, sizeof(DetectionInfo));
+    currentDetection.active = true;
+    currentDetection.timestamp = millis();
+    alertStartTime = millis();
+    alertFlashState = false;
+    totalDetections++;
+    
+    // Copy fields safely
+    strlcpy(currentDetection.protocol, 
+            doc["protocol"] | "unknown", sizeof(currentDetection.protocol));
+    
+    strlcpy(currentDetection.macAddress, 
+            doc["mac_address"] | "??:??:??", sizeof(currentDetection.macAddress));
+    
+    strlcpy(currentDetection.detectionMethod, 
+            doc["detection_method"] | "unknown", sizeof(currentDetection.detectionMethod));
+    
+    currentDetection.rssi = doc["rssi"] | -100;
+    currentDetection.threatScore = doc["threat_score"] | 50;
+    
+    // Device type
+    if (doc.containsKey("device_type")) {
+        strlcpy(currentDetection.deviceType, 
+                doc["device_type"], sizeof(currentDetection.deviceType));
+    } else {
+        strlcpy(currentDetection.deviceType, "FLOCK_SAFETY", sizeof(currentDetection.deviceType));
+    }
+    
+    // Identifier
+    if (doc.containsKey("ssid") && strlen(doc["ssid"] | "") > 0) {
+        strlcpy(currentDetection.identifier, doc["ssid"], sizeof(currentDetection.identifier));
+    } else if (doc.containsKey("device_name") && strlen(doc["device_name"] | "") > 0) {
+        strlcpy(currentDetection.identifier, doc["device_name"], sizeof(currentDetection.identifier));
+    }
+    
+    // Update statistics and assurity meter
+    int detectionScore = 5;
+    bool isKnownDevice = false;
+    
+    if (strstr(currentDetection.deviceType, "FLOCK")) {
+        flockDetections++;
+        detectionScore = 10;
+        isKnownDevice = true;
+    } else if (strstr(currentDetection.deviceType, "RAVEN")) {
+        ravenDetections++;
+        detectionScore = 9;
+        isKnownDevice = true;
+    } else if (strstr(currentDetection.deviceType, "PENGUIN")) {
+        penguinDetections++;
+        detectionScore = 8;
+        isKnownDevice = true;
+    } else if (strstr(currentDetection.deviceType, "SURVEILLANCE") || 
+               strstr(currentDetection.deviceType, "CAMERA") ||
+               strstr(currentDetection.deviceType, "LPR")) {
+        detectionScore = 7;
+        isKnownDevice = true;
+    } else {
+        detectionScore = 3;
+    }
+    
+    // Boost for strong signals
+    if (currentDetection.rssi > -50) {
+        detectionScore = min(detectionScore + 2, 10);
+    } else if (currentDetection.rssi > -70) {
+        detectionScore = min(detectionScore + 1, 10);
+    }
+    
+    // Record for assurity meter
+    if (isKnownDevice) {
+        recordPositiveDetection(detectionScore);
+    }
+    
+    // Track unique device (deduplicates across protocols)
+    bool isNewDevice = trackUniqueDevice(
+        currentDetection.macAddress,
+        currentDetection.protocol,
+        currentDetection.rssi,
+        isKnownDevice && detectionScore >= 7  // Only high-confidence matches
+    );
+    
+    // Track RSSI
+    lastRssi = currentDetection.rssi;
+    
+    Serial.printf("Detection #%d: %s @ %s (%d dBm) [score:%d, assurity:%d%%, unique:%d%s]\n", 
+                  totalDetections,
+                  currentDetection.deviceType,
+                  currentDetection.macAddress,
+                  currentDetection.rssi,
+                  detectionScore,
+                  assurityLevel,
+                  getConfirmedDeviceCount(),
+                  isNewDevice ? " NEW!" : "");
+}
+
+void processSerialData()
+{
+    while (Serial.available()) {
+        char c = Serial.read();
+        lastDataReceived = millis();
+        detectorConnected = true;
+        
+        if (c == '\n' || c == '\r') {
+            if (bufferIndex > 0) {
+                serialBuffer[bufferIndex] = '\0';
+                
+                // Check if it looks like JSON
+                if (serialBuffer[0] == '{') {
+                    parseDetectionJson(serialBuffer);
+                }
+                
+                bufferIndex = 0;
+            }
+        } else if (bufferIndex < sizeof(serialBuffer) - 1) {
+            serialBuffer[bufferIndex++] = c;
+        }
+    }
+    
+    // Check for connection timeout
+    if (millis() - lastDataReceived > 10000) {
+        detectorConnected = false;
+    }
+}
+
+// ============================================================================
+// STARTUP
+// ============================================================================
+
+void drawStartupScreen()
+{
+    display.clearDisplay();
+    
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(10, 10);
+    display.print(BRANDING);
+    
+    display.setTextSize(1);
+    display.setCursor(20, 35);
+    display.printf("v%s", VERSION);
+    
+    display.setCursor(15, 50);
+    display.print("deflock.me");
+    
+    display.display();
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+void setup()
+{
+    Serial.begin(DETECTOR_BAUD);
+    delay(1000);  // Give USB CDC time to enumerate
+    
+    Serial.println();
+    Serial.println("========================================");
+    Serial.printf("  %s Display v%s\n", BRANDING, VERSION);
+    Serial.println("  Heltec ESP32-S3 OLED Edition");
+    Serial.println("========================================");
+    Serial.println();
+    
+    // Initialize PRG button for reset
+    pinMode(PRG_BUTTON_PIN, INPUT_PULLUP);
+    Serial.printf("PRG button on GPIO%d (hold 2s to reset)\n", PRG_BUTTON_PIN);
+    
+    // Load persistent data from NVS
+    loadPersistentData();
+    
+    // Enable Vext to power the OLED (Heltec specific)
+    #ifdef VEXT_PIN
+        Serial.printf("Enabling Vext on GPIO%d\n", VEXT_PIN);
+        pinMode(VEXT_PIN, OUTPUT);
+        digitalWrite(VEXT_PIN, LOW);  // LOW = ON for Heltec
+        delay(100);
+    #endif
+    
+    // Initialize I2C with Heltec pins
+    Serial.printf("I2C: SDA=%d, SCL=%d\n", OLED_SDA, OLED_SCL);
+    Wire.begin(OLED_SDA, OLED_SCL);
+    
+    // Reset OLED
+    #ifdef OLED_RST
+        Serial.printf("OLED Reset on GPIO%d\n", OLED_RST);
+        pinMode(OLED_RST, OUTPUT);
+        digitalWrite(OLED_RST, LOW);
+        delay(50);
+        digitalWrite(OLED_RST, HIGH);
+        delay(50);
+    #endif
+    
+    // Initialize display
+    Serial.println("Initializing OLED...");
+    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        Serial.println("ERROR: SSD1306 init failed!");
+        Serial.println("Check wiring or try address 0x3D");
+        // Blink LED to indicate error
+        while (1) {
+            delay(500);
+        }
+    }
+    
+    Serial.printf("OLED ready: %dx%d\n", SCREEN_WIDTH, SCREEN_HEIGHT);
+    
+    // Show startup screen
+    display.clearDisplay();
+    display.setRotation(0);
+    drawStartupScreen();
+    delay(2000);
+    
+    startTime = millis();
+    lastDataReceived = millis();
+    
+    Serial.println();
+    Serial.println("Ready - waiting for detections...");
+    Serial.println("Send JSON data over USB serial");
+    Serial.println();
+}
+
+void loop()
+{
+    // Check PRG button for reset (hold 2 seconds)
+    checkResetButton();
+    
+    // Skip other processing if showing reset confirmation
+    if (showingResetConfirm) {
+        delay(10);
+        return;
+    }
+    
+    // Process incoming serial data
+    processSerialData();
+    
+    // Decay assurity over time
+    decayAssurity();
+    
+    // Periodically expire old devices (every 30 seconds)
+    static unsigned long lastExpireCheck = 0;
+    if (millis() - lastExpireCheck > 30000) {
+        expireOldDevices();
+        lastExpireCheck = millis();
+    }
+    
+    // Periodically save to NVS (reduces flash wear)
+    checkPeriodicSave();
+    
+    // Update display
+    unsigned long now = millis();
+    if (now - lastStatusUpdate >= STATUS_UPDATE_MS) {
+        updateDisplay();
+        lastStatusUpdate = now;
+    }
+    
+    delay(10);
+}

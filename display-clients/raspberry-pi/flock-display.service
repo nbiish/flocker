@@ -1,0 +1,26 @@
+# Flock Squawk Display Client - Systemd Service
+# 
+# Install:
+#   sudo cp flock-display.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable flock-display
+#   sudo systemctl start flock-display
+#
+# View logs:
+#   journalctl -u flock-display -f
+
+[Unit]
+Description=Flock Squawk Display Client
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/flock-you/display-clients/raspberry-pi
+Environment=DISPLAY=:0
+ExecStart=/home/pi/flock-you/display-clients/raspberry-pi/venv/bin/python3 flock_display.py --fullscreen
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
