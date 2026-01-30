@@ -63,8 +63,6 @@
 
 // Hardware watchdog timer (AGENTS_SECURE.md: fault recovery/safe state)
 #define WDT_TIMEOUT_SEC 30  // Reboot if loop hangs for 30 seconds
-#define MIN_CHANNEL 1
-#define MAX_CHANNEL_BOUND 14  // Hard limit
 
 // ============================================================================
 // DISPLAY CONFIGURATION (from platformio.ini or defaults)
@@ -222,15 +220,17 @@ struct ScanProfileConfig {
 
 // Profile configurations with CPU load indicator
 // Load: HIGH = aggressive scanning (more CPU), LOW = relaxed (less CPU)
+// bleWindow: Lower value = lower BLE duty cycle (lighter scanning)
 static const ScanProfileConfig scanProfiles[PROFILE_COUNT] = {
-    // HIGHWAY: 60+ mph, catch fleeting signals - HIGH CPU load
+    // HIGHWAY: 60+ mph, catch fleeting signals - HIGH CPU load, 100% BLE duty
     { "HIGHWAY", "HWY+", 50, 1, 300, 50 },
     
-    // URBAN: City driving, balanced performance (default) - MED CPU load
+    // URBAN: City driving, balanced performance (default) - MED CPU load, 100% BLE duty
     { "URBAN", "URB~", 100, 1, 500, 50 },
     
-    // SWEEP: Slow/stationary, maximum sensitivity - LOW CPU load
-    { "SWEEP", "SWP-", 300, 3, 1000, 30 }
+    // SWEEP: Slow/stationary, energy-saving sweep - LOW CPU load, 60% BLE duty
+    // Longer channel dwell time for thorough coverage, shorter BLE scans for responsiveness
+    { "SWEEP", "SWP-", 250, 1, 800, 30 }
 };
 
 // Current profile (default: URBAN)
@@ -741,6 +741,7 @@ void ledAlertUpdate()
 // ============================================================================
 
 // Apply current scan profile settings
+// Updates both timing variables AND reconfigures BLE scanner duty cycle
 void applyScanProfile(ScanProfile profile)
 {
     if (profile >= PROFILE_COUNT) profile = PROFILE_URBAN;
@@ -749,6 +750,16 @@ void applyScanProfile(ScanProfile profile)
     channelHopInterval = scanProfiles[profile].channelHopMs;
     bleScanDuration = scanProfiles[profile].bleScanDuration;
     bleScanInterval = scanProfiles[profile].bleScanInterval;
+    
+    // CRITICAL: Apply BLE window setting to scanner (was missing!)
+    // This actually changes the scan duty cycle for lighter/heavier scanning
+    if (pBLEScan != nullptr) {
+        int bleWindow = scanProfiles[profile].bleWindow;
+        pBLEScan->setWindow(bleWindow);
+        pBLEScan->setInterval(50);  // Keep interval constant, vary window for duty cycle
+        Serial.printf("[PROFILE] BLE duty cycle: %d%% (window=%dms/50ms)\n",
+                      (bleWindow * 100) / 50, bleWindow);
+    }
     
     Serial.printf("[PROFILE] Switched to %s: CH=%dms, BLE=%ds/%dms\n",
                   scanProfiles[profile].name,
@@ -1700,14 +1711,14 @@ void setup()
     Serial.printf("[WiFi] Monitoring %d SSID patterns, %d MAC prefixes\n", 
                   SSID_PATTERN_COUNT, MAC_PREFIX_COUNT);
     
-    // Initialize BLE - Aggressive scanning for maximum detection
-    Serial.println("\n[BLE] Initializing scanner (AGGRESSIVE MODE)...");
+    // Initialize BLE - settings will be adjusted per scan profile
+    Serial.println("\n[BLE] Initializing scanner...");
     NimBLEDevice::init("");
     pBLEScan = NimBLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new MyBLEAdvertisedDeviceCallbacks(), false);
     pBLEScan->setActiveScan(true);      // Active scan gets device names
-    pBLEScan->setInterval(50);          // 50ms interval (was 100)
-    pBLEScan->setWindow(50);            // 100% duty cycle - continuous listening
+    pBLEScan->setInterval(50);          // 50ms interval - base timing
+    pBLEScan->setWindow(scanProfiles[currentProfile].bleWindow);  // Duty cycle from profile
     pBLEScan->setMaxResults(0);         // Don't store results, process in callback
     pBLEScan->setDuplicateFilter(false); // Don't filter duplicates - catch every packet
     

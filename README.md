@@ -22,10 +22,18 @@ This fork adds **standalone display clients** that operate independently without
 | BLE Active Scan | Device names, MAC prefixes, Raven service UUIDs |
 | OLED Display | 128x64 status/alert with radar animation |
 | Scan Profiles | HIGHWAY (HWY+), URBAN (URB~), SWEEP (SWP-) |
+| Dynamic BLE Duty Cycle | 100% (Highway/Urban) or 60% (Sweep) for energy savings |
 | Stealth Mode | Display/LED off while scanning continues |
 | Hardware Watchdog | 30s WDT auto-reboot (JPL Rule compliance) |
 | Persistent Stats | NVS storage across reboots |
 | FLOCK-ER Meter | Confidence % based on signal strength |
+
+#### Scan Profiles
+| Profile | WiFi Hop | BLE Scan | BLE Interval | BLE Duty | Use Case |
+|---------|----------|----------|--------------|----------|----------|
+| HIGHWAY (HWY+) | 50ms | 1s | 300ms | 100% | High-speed driving (60+ mph) |
+| URBAN (URB~) | 100ms | 1s | 500ms | 100% | City driving (balanced) |
+| SWEEP (SWP-) | 250ms | 1s | 800ms | 60% | Parking lot / stationary (energy-saving) |
 
 #### Button Controls
 | Action | Trigger | Result |

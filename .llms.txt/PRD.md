@@ -18,10 +18,10 @@ targets[4]{id,name,protocol,patterns}:
   4,Penguin Devices,WiFi,SSID:Penguin*
 
 # Scan Profiles
-profiles[3]{id,name,shortName,wifiHopMs,bleScanDur,bleScanInt,bleWindow,load}:
-  1,HIGHWAY,HWY+,50ms,1s,300ms,50ms,HIGH
-  2,URBAN,URB~,100ms,1s,500ms,50ms,MED
-  3,SWEEP,SWP-,300ms,3s,1000ms,30ms,LOW
+profiles[3]{id,name,shortName,wifiHopMs,bleScanDur,bleScanInt,bleWindow,bleDuty,load}:
+  1,HIGHWAY,HWY+,50ms,1s,300ms,50ms,100%,HIGH
+  2,URBAN,URB~,100ms,1s,500ms,50ms,100%,MED
+  3,SWEEP,SWP-,250ms,1s,800ms,30ms,60%,LOW
 
 # Features
 features[12]{id,name,pri,status,description}:

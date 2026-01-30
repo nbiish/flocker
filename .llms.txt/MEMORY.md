@@ -34,8 +34,9 @@ conflicts{scenario,resolution}:
   Rebase preferred,git pull --rebase upstream main for linear history
 
 # Session Facts
-facts[3]{topic,detail,timestamp}:
+facts[4]{topic,detail,timestamp}:
   stack,ESP32/PlatformIO/C++,2026-01-29T00:00:00Z
   fork_setup,Configured dual-remote workflow,2026-01-29T00:00:00Z
   branch,main tracks origin/main (nbiish/flocker),2026-01-29T00:00:00Z
+  sweep_fix,Fixed SWEEP profile BLE duty cycle + responsiveness (v3.2.0-secure),2026-01-29T23:40:00Z
 ```
